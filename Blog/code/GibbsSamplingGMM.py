@@ -198,7 +198,7 @@ class Gibbs_GMM(object):
 
     def train(self, nIter, plot=False):
         for t in range(nIter):
-            print "Iteration %d" % t
+            print("Iteration %d" % t)
             self._fc_indicators()
             self._fc_mixings()
             self._fc_mean()
