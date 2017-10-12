@@ -4,21 +4,28 @@ import matplotlib.mlab as mlab
 from scipy.stats import invwishart
 import matplotlib.animation as animation
 import time
+import math
+import logging
+plt.rcParams['animation.ffmpeg_path'] = '/usr/local/Cellar/ffmpeg/3.3.4/bin/ffmpeg'
 
-DEFAULT_PRIOR_COV_SCALE = 10
+DEFAULT_PRIOR_COV_SCALE = 9
 DEFAULT_PRIOR_MEAN_STRENGTH = 2
-DEFAULT_PRIOR_SCALE_DF = 5
+DEFAULT_PRIOR_SCALE_DF = 10
+
+LOG_FILENAME = 'gibbsConjugate.log'
+logging.basicConfig(filename=LOG_FILENAME,level=logging.DEBUG, filemode='w')
 
 class gaussian_cluster(object):
     def __init__(self, prior_mean, prior_mean_strength, prior_cov_scale, prior_cov_df, prior_mixing):
         assert len(prior_cov_scale.shape) == 2, "Scale matrix must be two-dimensional"
         assert prior_cov_scale.shape[0] == prior_cov_scale.shape[1], "Scale matrix must be square"
+        assert len(prior_mean) == len(prior_cov_scale), "Prior mean vector not same dimension as prior scale"
         assert prior_mean_strength > 0, "Prior mean strength (kappa) must be positive"
         assert prior_cov_df >= prior_cov_scale.shape[0], "Prior degrees of freedom must be at least data dimension."
 
         ### Mean and Covariance of Gaussian cluster
-        self.cov = invwishart.rvs(prior_cov_df, prior_cov_scale, size=1)
-        self.mean = np.random.multivariate_normal(mean=prior_mean, cov=1.0/prior_mean_strength * cov)
+        self.cov = invwishart.rvs(df=prior_cov_df, scale=prior_cov_scale, size=1)
+        self.mean = np.random.multivariate_normal(mean=prior_mean, cov=1.0/float(prior_mean_strength) * self.cov)
 
         self.prior_mean = prior_mean
         self.prior_mean_strength = prior_mean_strength
@@ -27,7 +34,7 @@ class gaussian_cluster(object):
 
         ### Responsibility:
         self.prior_mixing = prior_mixing # alpha_k
-        self.prevalence = prior_mixing # pi_k
+        self.post_mixing = prior_mixing # pi_k
         self.post_count = 0
 
 class Gibbs_GMM(object):
@@ -113,7 +120,7 @@ class Gibbs_GMM(object):
         data = self.data
         for i in range(indicators.shape[0]):
             x = data[i,:]
-            p_indicator = [clusters[k].post_mixing * self.gaussian_2d(x, clusters[k].post_mean, clusters[k].post_cov) \
+            p_indicator = [clusters[k].post_mixing * self.gaussian_2d(x, clusters[k].mean, clusters[k].cov) \
                             for k in range(self.nClusters)]
             norm = np.sum(p_indicator)
             p_indicator = [p_indicator[k]/norm for k in range(self.nClusters)]
@@ -135,7 +142,7 @@ class Gibbs_GMM(object):
         assert np.abs(checkSum - 1) < 1e-3, "Mixing proportions dont sum up to one."
         self.clusters = clusters
 
-    def _fc_Gaussian(self):
+    def _fc_gaussians(self):
         """
         Samples the next mean and covariance for each cluster from the Normal Inverse Wishart with posterior parameters
         :return:
@@ -145,42 +152,45 @@ class Gibbs_GMM(object):
         indicators = self.indicators
 
         for k in range(self.nClusters):
+            cluster = clusters[k]
+            data_in_cluster = data[indicators[:,k] == 1.0]
+            mean_data_in_cluster = np.mean(data_in_cluster, axis=0)
+            assert cluster.post_count == len(data_in_cluster), \
+                "Cluster count incorrect: %d <> %d" % (cluster.post_count, len(data_in_cluster))
+
+            # Update parameters of normal inverse wishart distribution
+            post_strength = cluster.prior_mean_strength + cluster.post_count
+            post_mean = (cluster.prior_mean_strength*cluster.prior_mean +
+                         cluster.post_count*np.mean(data_in_cluster, axis=0))/float(post_strength)
+            post_scale = cluster.prior_cov_scale + self.emp_cov(data_in_cluster) + \
+                         (cluster.prior_mean_strength*cluster.post_count)/(cluster.prior_mean_strength+cluster.post_count)*\
+                         np.outer((mean_data_in_cluster-cluster.prior_mean),(mean_data_in_cluster-cluster.prior_mean))
+
+            #post_scale = cluster.prior_cov_scale + (cluster.post_count-1.0)*self.emp_cov(data_in_cluster)+\
+            #                cluster.prior_mean_strength*np.outer(cluster.prior_mean, cluster.prior_mean)-\
+            #                post_strength*np.outer(post_mean, post_mean)
+            post_df = cluster.prior_cov_df + cluster.post_count
+
+            post_mean, post_strength, post_scale, post_df = self._post_niw_params(cluster=cluster,
+                                                                                  data_in_cluster=data_in_cluster)
+
             # Sample covariance
-            cluster = self.clusters[k]
-            post_scale = cluster.prior_cov_scale + (cluster.post_count-1)*self.emp_cov(data[indicators[:,k] == 1.0])
+            cluster.cov = invwishart.rvs(df=post_df, scale=post_scale, size=1)
 
             # Sample mean
-
-    def _fc_mean(self):
-        clusters = self.clusters
-        data = self.data
-        for k in range(self.nClusters):
-            cluster = clusters[k]
-            post_prec = np.linalg.inv(cluster.post_cov) # Sigma_k^-1
-            # TODO Correct covariance for mean
-            cluster.post_m_cov = np.linalg.inv(cluster.prior_m_prec + cluster.post_count * post_prec) # V_k
-
-            tmp = np.linalg.solve(cluster.post_cov, np.sum(data[self.indicators[:,k]==1,:],axis=0)) + \
-                  np.linalg.solve(cluster.prior_m_cov, cluster.prior_m_mean)
-            cluster.post_mean = np.dot(cluster.post_m_cov, tmp)
-            clusters[k] = cluster
-        self.clusters = clusters
+            cluster.mean = np.random.multivariate_normal(mean=post_mean, cov=1.0/float(post_strength)*cluster.cov)
 
 
-    def _fc_cov(self):
-        data = self.data
-        indicators = self.indicators
-        clusters = self.clusters
-        for k in range(self.nClusters):
-            cluster = clusters[k]
-            tmp = data[indicators[:,k] == 1,:]
-            tmp = tmp - np.array([cluster.post_mean,]*len(tmp))
-            cluster.post_cov_scale = cluster.prior_cov_scale + np.dot(tmp.transpose(), tmp)
-            cluster.post_cov_df = cluster.prior_cov_df + cluster.post_count
-            cluster.post_cov = invwishart.rvs(cluster.post_cov_df, cluster.post_cov_scale, size=1)
-            clusters[k] = cluster
+            logging.info("-----------------")
+            logging.info("\t\tCluster {}".format(k))
+            logging.info("\t\t\tCount: {}".format(cluster.post_count))
+            logging.info("\t\t\tMean: {}".format(cluster.mean))
+            logging.info("\t\t\tCov: {}".format(cluster.cov))
+            logging.info("\t\t\tPost cov scale:{}".format(post_scale))
+            logging.info("\t\t\tPost cov df:{}".format(post_df))
 
-        self.clusters = clusters
+            assert len(cluster.mean) == len(cluster.cov),"len(mean) <> len(cov) for cluster %d" % k
+            self.clusters[k] = cluster
 
     @staticmethod
     def emp_cov(data):
@@ -190,9 +200,10 @@ class Gibbs_GMM(object):
         :return: (data - mean(data))^T (data - mean(data))
         """
         assert len(data.shape) == 2
+        assert data.shape[0] > 1
         mean_data = np.vstack((np.mean(data,axis=0) for _ in range(data.shape[0])))
         data -= mean_data
-        return np.transpose(data).dot(data)
+        return 1.0/float(data.shape[0] - 1) * np.dot(np.transpose(data), data)
 
     @staticmethod
     def gaussian_2d(x, mean, cov):
@@ -221,13 +232,75 @@ class Gibbs_GMM(object):
         np.random.shuffle(res)
         return res
 
+    def _update_log_lik(self):
+        """
+        Compute log p(X, z| alpha, beta) to see how good the fit is after the current iteration
+        """
+        data = self.data
+        clusters = self.clusters
+        indicators = self.indicators
+
+        log_lik = 0
+        for k in range(self.nClusters):
+            data_in_cluster = data[indicators[:,k] == 1.0]
+            cluster = clusters[k]
+
+            # Compute p(X_k| beta)
+            d = data_in_cluster.shape[1]
+            kappa_N = cluster.prior_mean_strength + cluster.post_count
+            kappa_0 = cluster.prior_mean_strength
+            nu_N = cluster.prior_cov_df + cluster.post_count
+            nu_0 = cluster.prior_cov_df
+            cov_scale_N =
+            self._niw_normalisation(dim=data_in_cluster.shape[1], prior_strength=cluster.prior_mean_streng)
+
+
+    def _post_niw_params(self, cluster, data_in_cluster):
+        """
+        Computes Normal Inverse Wishart parameters for
+        p(mean_of_cluster, Cov_of_cluster| data_in_cluster) = NIW(mean_of_cluster, Cov_of_cluster| params)
+        for a given cluster.
+        :param cluster: a Cluster object
+        :param data_in_cluster: the data assigned to that cluster of size (N_k) x D
+        :return: m_N, kappa_N, scale_N, nu_N
+        """
+        mean_data_in_cluster = np.mean(data_in_cluster, axis=0)
+        post_strength = cluster.prior_mean_strength + cluster.post_count
+        post_mean = (cluster.prior_mean_strength*cluster.prior_mean +
+                     cluster.post_count*np.mean(data_in_cluster, axis=0))/float(post_strength)
+        post_scale = cluster.prior_cov_scale + self.emp_cov(data_in_cluster) + \
+                     (cluster.prior_mean_strength*cluster.post_count)/(cluster.prior_mean_strength+cluster.post_count)*\
+                     np.outer((mean_data_in_cluster-cluster.prior_mean),(mean_data_in_cluster-cluster.prior_mean))
+        return post_mean, \
+               cluster.prior_mean_strength + cluster.post_count, \
+               post_scale, \
+               cluster.prior_cov_df + cluster.post_count
+
+    def _niw_normalisation(self, dim, prior_strength, cov_df, cov_scale):
+        """
+        Computes the normalisation constant of the Normal Inverse Wishart distribtuion
+        See e.g. Murphy, K.: Machine Learning - A Probabilistic Perspective, p.133
+        :param dim: dimension of mean (D)
+        :param prior_strength: strength of prior mean (kappa)
+        :param cov_df: degrees of freedom (nu)
+        :param cov_scale: scale matrix (S)
+        """
+        dim = float(dim)
+        cov_df = float(cov_df)
+        prior_strength = float(prior_strength)
+        return 2.0**(dim*cov_df/2.0) * \
+                math.gamma(cov_df/2.0)*(2.0*np.pi/prior_strength)**(dim/2.0)* \
+                np.linalg.det(cov_scale)**(-cov_df/2.0)
+
     def train(self, nIter, plot=False):
         for t in range(nIter):
-            print("Iteration %d" % t)
+            logging.info("----------------------------------------------------")
+            logging.info("Iteration %d" % t)
             self._fc_indicators()
             self._fc_mixings()
-            self._fc_mean()
-            self._fc_cov()
+            self._fc_gaussians()
+
+            self._update_log_lik()
 
             if plot:
                 self.update_plot(t)
@@ -238,12 +311,14 @@ class Gibbs_GMM(object):
             self.ax.set_xlim(-10,10)
             self.ax.set_ylim(-10,10)
             plt.show()
-            #ani.save('GibbsGMM.mp4', writer = 'mencoder', fps=2)
-            #ani.save('GibbsGMM.mp4', writer=writer)
+            #ani.save('GibbsGMM_2.mp4', fps=2)
+            #ani.save('GibbsGMM_2.mp4', writer = 'mencoder', fps=2)
+            FFwriter = animation.FFMpegWriter()
+            ani.save('GibbsGMM_2.mp4', writer=FFwriter, fps=2)
 
 if __name__ == "__main__":
     prior_means = [np.array([3,0]), np.array([0,-2]), np.array([-3,0])]
     gmm = Gibbs_GMM(nClusters=3, N=200, prior_means=prior_means)
-    gmm.train(nIter=15, plot=True)
+    gmm.train(nIter=25, plot=True)
     plt.show()
 

@@ -4,6 +4,10 @@ import matplotlib.mlab as mlab
 from scipy.stats import invwishart
 import matplotlib.animation as animation
 import time
+import logging
+
+LOG_FILENAME = 'gibbs.log'
+logging.basicConfig(filename=LOG_FILENAME,level=logging.DEBUG, filemode='w')
 
 class cluster(object):
     def __init__(self, prior_mean, prior_m_cov, prior_cov_scale, prior_cov_df, prior_mixing):
@@ -167,6 +171,14 @@ class Gibbs_GMM(object):
             cluster.post_cov = invwishart.rvs(cluster.post_cov_df, cluster.post_cov_scale, size=1)
             clusters[k] = cluster
 
+            logging.info("-----------------")
+            logging.info("\t\tCluster {}".format(k))
+            logging.info("\t\t\tCount: {}".format(cluster.post_count))
+            logging.info("\t\t\tMean: {}".format(cluster.post_mean))
+            logging.info("\t\t\tCov: {}".format(cluster.post_cov))
+            logging.info("\t\t\tPost cov scale:{}".format(cluster.post_cov_scale))
+            logging.info("\t\t\tPost cov df:{}".format(cluster.post_cov_df))
+
         self.clusters = clusters
 
     @staticmethod
@@ -198,7 +210,7 @@ class Gibbs_GMM(object):
 
     def train(self, nIter, plot=False):
         for t in range(nIter):
-            print("Iteration %d" % t)
+            logging.info("Iteration %d" % t)
             self._fc_indicators()
             self._fc_mixings()
             self._fc_mean()
