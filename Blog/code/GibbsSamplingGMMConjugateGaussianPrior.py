@@ -85,6 +85,8 @@ class Gibbs_GMM(object):
 
         self.indicators = np.zeros((self.nObs, nClusters))
 
+        self.log_lik_values = []
+
         ##########################################
         plt.ion()
         self.f, self.ax = plt.subplots()
@@ -154,23 +156,10 @@ class Gibbs_GMM(object):
         for k in range(self.nClusters):
             cluster = clusters[k]
             data_in_cluster = data[indicators[:,k] == 1.0]
-            mean_data_in_cluster = np.mean(data_in_cluster, axis=0)
             assert cluster.post_count == len(data_in_cluster), \
                 "Cluster count incorrect: %d <> %d" % (cluster.post_count, len(data_in_cluster))
 
             # Update parameters of normal inverse wishart distribution
-            post_strength = cluster.prior_mean_strength + cluster.post_count
-            post_mean = (cluster.prior_mean_strength*cluster.prior_mean +
-                         cluster.post_count*np.mean(data_in_cluster, axis=0))/float(post_strength)
-            post_scale = cluster.prior_cov_scale + self.emp_cov(data_in_cluster) + \
-                         (cluster.prior_mean_strength*cluster.post_count)/(cluster.prior_mean_strength+cluster.post_count)*\
-                         np.outer((mean_data_in_cluster-cluster.prior_mean),(mean_data_in_cluster-cluster.prior_mean))
-
-            #post_scale = cluster.prior_cov_scale + (cluster.post_count-1.0)*self.emp_cov(data_in_cluster)+\
-            #                cluster.prior_mean_strength*np.outer(cluster.prior_mean, cluster.prior_mean)-\
-            #                post_strength*np.outer(post_mean, post_mean)
-            post_df = cluster.prior_cov_df + cluster.post_count
-
             post_mean, post_strength, post_scale, post_df = self._post_niw_params(cluster=cluster,
                                                                                   data_in_cluster=data_in_cluster)
 
@@ -179,7 +168,6 @@ class Gibbs_GMM(object):
 
             # Sample mean
             cluster.mean = np.random.multivariate_normal(mean=post_mean, cov=1.0/float(post_strength)*cluster.cov)
-
 
             logging.info("-----------------")
             logging.info("\t\tCluster {}".format(k))
@@ -241,19 +229,40 @@ class Gibbs_GMM(object):
         indicators = self.indicators
 
         log_lik = 0
+        total_alpha_prior = 0
+        log_gamma_ratios = 0
         for k in range(self.nClusters):
             data_in_cluster = data[indicators[:,k] == 1.0]
             cluster = clusters[k]
 
-            # Compute p(X_k| beta)
-            d = data_in_cluster.shape[1]
-            kappa_N = cluster.prior_mean_strength + cluster.post_count
-            kappa_0 = cluster.prior_mean_strength
-            nu_N = cluster.prior_cov_df + cluster.post_count
-            nu_0 = cluster.prior_cov_df
-            cov_scale_N =
-            self._niw_normalisation(dim=data_in_cluster.shape[1], prior_strength=cluster.prior_mean_streng)
+            # Compute log p(X_k| beta)
+            d = float(data_in_cluster.shape[1])
+            m_N, kappa_N, S_N, nu_N = self._post_niw_params(cluster=cluster, data_in_cluster=data_in_cluster)
+            m_0, kappa_0, S_0, nu_0 = cluster.prior_mean, cluster.prior_mean_strength, cluster.prior_cov_scale, cluster.prior_cov_df
 
+            post_norm = self._niw_normalisation(dim=d, prior_strength=kappa_N, cov_df=nu_N, cov_scale=S_N)
+            prior_norm = self._niw_normalisation(dim=d, prior_strength=kappa_0, cov_df=nu_0, cov_scale=S_0)
+
+            cluster_log_lik = -(cluster.post_count*d)/2.0 * np.log(2.0*np.pi) + np.log(post_norm) - np.log(prior_norm)
+            log_lik += cluster_log_lik
+
+            """
+            total_alpha_prior += cluster.prior_mixing
+
+            logging.debug("~~~~~~~~~~~")
+            logging.debug("cluster.post_count + cluster.prior_mixing={}".format(cluster.post_count + cluster.prior_mixing))
+            logging.debug("math.gamma(cluster.post_count + cluster.prior_mixing)={}".format(math.gamma(cluster.post_count + cluster.prior_mixing)))
+            logging.debug("math.gamma(cluster.prior_mixing)={}".format(math.gamma(cluster.prior_mixing)))
+            log_gamma_ratios += np.log(math.gamma(cluster.post_count + cluster.prior_mixing)) \
+                                    - np.log(math.gamma(cluster.prior_mixing))
+        # Compute log p(z| alpha)
+        log_indicator_marginal = np.log(math.gamma(total_alpha_prior))-np.log(math.gamma(len(data)+total_alpha_prior))\
+                                    + log_gamma_ratios
+
+        log_lik += log_indicator_marginal
+        """
+        self.log_lik_values.append(log_lik)
+        return
 
     def _post_niw_params(self, cluster, data_in_cluster):
         """
@@ -288,9 +297,17 @@ class Gibbs_GMM(object):
         dim = float(dim)
         cov_df = float(cov_df)
         prior_strength = float(prior_strength)
-        return 2.0**(dim*cov_df/2.0) * \
-                math.gamma(cov_df/2.0)*(2.0*np.pi/prior_strength)**(dim/2.0)* \
-                np.linalg.det(cov_scale)**(-cov_df/2.0)
+        pi = np.pi
+
+        return 2**((cov_df+1)*dim/2.0)*\
+               pi**((dim+1)*dim/4.0)*\
+               prior_strength**(-dim/2.0)*\
+               np.linalg.det(cov_scale)**(-cov_df/2.0)*\
+               np.prod(np.array([math.gamma((cov_df+1.0-i)/2.0) for i in range(1,int(dim+1))]))
+
+        #return 2.0**(dim*cov_df/2.0) * \
+        #        math.gamma(cov_df/2.0)*(2.0*np.pi/prior_strength)**(dim/2.0)* \
+        #        np.linalg.det(cov_scale)**(-cov_df/2.0)
 
     def train(self, nIter, plot=False):
         for t in range(nIter):
@@ -304,6 +321,10 @@ class Gibbs_GMM(object):
 
             if plot:
                 self.update_plot(t)
+
+            plt.plot(self.log_lik_values)
+            plt.show()
+
         if plot:
             ani = animation.ArtistAnimation(self.f, self.ims, interval=500, blit=True,
                             repeat_delay=100)
