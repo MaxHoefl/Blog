@@ -2,11 +2,16 @@ import numpy as np
 from matplotlib import pyplot as plt
 import matplotlib.mlab as mlab
 from scipy.stats import invwishart
+import scipy.special as sci
 import matplotlib.animation as animation
+import matplotlib
 import time
 import math
 import logging
 plt.rcParams['animation.ffmpeg_path'] = '/usr/local/Cellar/ffmpeg/3.3.4/bin/ffmpeg'
+np.seterr(all='ignore')
+plt.ioff()
+matplotlib.use('Agg')
 
 DEFAULT_PRIOR_COV_SCALE = 9
 DEFAULT_PRIOR_MEAN_STRENGTH = 2
@@ -14,6 +19,42 @@ DEFAULT_PRIOR_SCALE_DF = 10
 
 LOG_FILENAME = 'gibbsConjugate.log'
 logging.basicConfig(filename=LOG_FILENAME,level=logging.DEBUG, filemode='w')
+
+# TODO: Delete when done debugging. This method is contained in matplotlib/mlab.py. Check _update_plot()
+def bivariate_normal(X, Y, sigmax=1.0, sigmay=1.0,
+                     mux=0.0, muy=0.0, sigmaxy=0.0):
+    """
+    Bivariate Gaussian distribution for equal shape *X*, *Y*.
+
+    See `bivariate normal
+    <http://mathworld.wolfram.com/BivariateNormalDistribution.html>`_
+    at mathworld.
+    """
+    logging.debug("\t\t\t---- bivariate_normal() ----")
+    logging.debug("\t\t\tmux={}, muy={}".format(mux,muy))
+    logging.debug("\t\t\tsigmax={}, sigmay={}, sigmaxy={}".format(sigmax, sigmay, sigmaxy))
+
+    Xmu = X-mux
+    Ymu = Y-muy
+
+    try:
+        rho = sigmaxy/np.sqrt(sigmax*sigmay)
+        logging.debug("\t\t\trho={}".format(rho))
+
+        z = Xmu**2/sigmax**2 + Ymu**2/sigmay**2 - 2*rho*Xmu*Ymu/(sigmax*sigmay)
+        logging.debug("\t\t\tz={}".format(z))
+
+        denom = 2*np.pi*sigmax*sigmay*np.sqrt(1-rho**2)
+        logging.debug("\t\t\tdenom={}".format(denom))
+
+        res = np.exp(-z/(2*(1-rho**2))) / denom
+        logging.debug("\t\t\tres={}".format(res))
+        return res
+    except Warning:
+        logging.error("WARNING in bivariate_normal")
+        raise Exception
+
+
 
 class gaussian_cluster(object):
     def __init__(self, prior_mean, prior_mean_strength, prior_cov_scale, prior_cov_df, prior_mixing):
@@ -40,6 +81,7 @@ class gaussian_cluster(object):
 class Gibbs_GMM(object):
     def __init__(self, nClusters, data=None, N=None, prior_means=None, prior_mean_strength=None,
                  prior_cov_scale=None, prior_cov_df=None, prior_mixings=None):
+        plt.ioff()
 
         self.nClusters = nClusters
 
@@ -93,6 +135,9 @@ class Gibbs_GMM(object):
         self.ims = []
         #self.update_plot()
 
+    def is_pos_def(self,x):
+        return np.all(np.linalg.eigvals(x) > 0)
+
     def update_plot(self, count):
 
         delta = 0.025
@@ -106,15 +151,45 @@ class Gibbs_GMM(object):
         for cluster in self.clusters.values():
             mean = cluster.mean
             cov = cluster.cov
-            Z = mlab.bivariate_normal(X, Y, cov[0,0], cov[1,1], mean[0], mean[1], cov[0,1])
+            assert self.is_pos_def(cov), "Covariance matrix {} not positive definite".format(cov)
+            Z = bivariate_normal(X=X, Y=Y, sigmax=cov[0,0], sigmay=cov[1,1], mux=mean[0], muy=mean[1], sigmaxy=cov[0,1])
+            #Z = mlab.bivariate_normal(X, Y, cov[0,0], cov[1,1], mean[0], mean[1], cov[0,1])
             if Ztot is None:
                 Ztot = Z
             else:
                 Ztot += Z
+
         im = self.ax.imshow(Ztot, animated=True ,aspect='auto',origin='lower',extent=(X.min(),X.max(),Y.min(),Y.max()))
         im2 = self.ax.scatter(x=self.data[:,0], y=self.data[:,1], c='black', s=20, alpha=0.5)
         self.ims.append([im,im2])
 
+    def save_current_plot(self, count, fname=None):
+
+        f,ax = plt.subplots()
+        delta = 0.025
+        x = np.arange(-10.0, 10.0, delta)
+        y = np.arange(-10.0, 10.0, delta)
+        X, Y = np.meshgrid(x, y)
+
+        Ztot = None
+        im = None
+
+        for cluster in self.clusters.values():
+            mean = cluster.mean
+            cov = cluster.cov
+            assert self.is_pos_def(cov), "Covariance matrix {} not positive definite".format(cov)
+            Z = bivariate_normal(X=X, Y=Y, sigmax=cov[0,0], sigmay=cov[1,1], mux=mean[0], muy=mean[1], sigmaxy=cov[0,1])
+            #Z = mlab.bivariate_normal(X, Y, cov[0,0], cov[1,1], mean[0], mean[1], cov[0,1])
+            if Ztot is None:
+                Ztot = Z
+            else:
+                Ztot += Z
+        ax.contour(X,Y,Ztot)
+        if fname is None:
+            fname = "GMM_{}.png".format(count)
+        ax.set_title(fname)
+        f.savefig(fname)
+        plt.close()
 
     def _fc_indicators(self):
         indicators = self.indicators
@@ -165,6 +240,14 @@ class Gibbs_GMM(object):
 
             # Sample covariance
             cluster.cov = invwishart.rvs(df=post_df, scale=post_scale, size=1)
+            assert len(cluster.cov.shape) == 2
+            assert cluster.cov.shape[0] == 2
+            assert cluster.cov.shape[1] == 2
+            sigmaxy = cluster.cov[0,1]
+            sigmax = cluster.cov[0,0]
+            sigmay = cluster.cov[1,1]
+            rho = sigmaxy/(np.sqrt(sigmax)*np.sqrt(sigmay))
+            assert np.abs(rho) <= 1, "Rho {} too large!".format(rho)
 
             # Sample mean
             cluster.mean = np.random.multivariate_normal(mean=post_mean, cov=1.0/float(post_strength)*cluster.cov)
@@ -240,27 +323,39 @@ class Gibbs_GMM(object):
             m_N, kappa_N, S_N, nu_N = self._post_niw_params(cluster=cluster, data_in_cluster=data_in_cluster)
             m_0, kappa_0, S_0, nu_0 = cluster.prior_mean, cluster.prior_mean_strength, cluster.prior_cov_scale, cluster.prior_cov_df
 
-            post_norm = self._niw_normalisation(dim=d, prior_strength=kappa_N, cov_df=nu_N, cov_scale=S_N)
-            prior_norm = self._niw_normalisation(dim=d, prior_strength=kappa_0, cov_df=nu_0, cov_scale=S_0)
+            #post_norm = self._niw_normalisation(dim=d, prior_strength=kappa_N, cov_df=nu_N, cov_scale=S_N)
+            #prior_norm = self._niw_normalisation(dim=d, prior_strength=kappa_0, cov_df=nu_0, cov_scale=S_0)
 
-            cluster_log_lik = -(cluster.post_count*d)/2.0 * np.log(2.0*np.pi) + np.log(post_norm) - np.log(prior_norm)
+            log_post_norm = self._log_niw_normalisation(dim=d, prior_strength=kappa_N, cov_df=nu_N, cov_scale=S_N)
+            log_prior_norm = self._log_niw_normalisation(dim=d, prior_strength=kappa_0, cov_df=nu_0, cov_scale=S_0)
+
+            cluster_log_lik = -(cluster.post_count*d)/2.0 * np.log(2.0*np.pi) + log_post_norm - log_prior_norm
+            # TODO: remove unnecessary logging
+            logging.debug("post_norm={}, prior_norm={}".format(log_post_norm, log_prior_norm))
+            logging.debug("cluster_log_lik={}".format(cluster_log_lik))
+            logging.debug("~~~~~~~~~~~~~~~")
+
             log_lik += cluster_log_lik
 
-            """
             total_alpha_prior += cluster.prior_mixing
 
-            logging.debug("~~~~~~~~~~~")
-            logging.debug("cluster.post_count + cluster.prior_mixing={}".format(cluster.post_count + cluster.prior_mixing))
-            logging.debug("math.gamma(cluster.post_count + cluster.prior_mixing)={}".format(math.gamma(cluster.post_count + cluster.prior_mixing)))
-            logging.debug("math.gamma(cluster.prior_mixing)={}".format(math.gamma(cluster.prior_mixing)))
-            log_gamma_ratios += np.log(math.gamma(cluster.post_count + cluster.prior_mixing)) \
-                                    - np.log(math.gamma(cluster.prior_mixing))
-        # Compute log p(z| alpha)
-        log_indicator_marginal = np.log(math.gamma(total_alpha_prior))-np.log(math.gamma(len(data)+total_alpha_prior))\
-                                    + log_gamma_ratios
+            # TODO: remove unnecessary comment
+            #logging.debug("~~~~~~~~~~~")
+            #logging.debug("sci.gammaln(cluster.post_count + cluster.prior_mixing)={}".format(sci.gammaln(cluster.post_count + cluster.prior_mixing)))
 
-        log_lik += log_indicator_marginal
-        """
+            log_gamma_ratios += sci.gammaln(cluster.post_count + cluster.prior_mixing) \
+                                    - sci.gammaln(cluster.prior_mixing)
+
+        # Compute log p(z| alpha)
+        log_indicator_marginal = sci.gammaln(total_alpha_prior) - sci.gammaln(len(data)+total_alpha_prior)\
+                                    + log_gamma_ratios
+        # TODO: remove unnecessary logging
+        logging.debug("log_indicator_marginal={}".format(log_indicator_marginal))
+        logging.debug("~~~~~~~~~~~~~~~")
+
+        # TODO: Uncomment
+        #log_lik += log_indicator_marginal
+
         self.log_lik_values.append(log_lik)
         return
 
@@ -285,6 +380,30 @@ class Gibbs_GMM(object):
                post_scale, \
                cluster.prior_cov_df + cluster.post_count
 
+    def _log_niw_normalisation(self, dim, prior_strength, cov_df, cov_scale):
+        """
+        Computes the log normalisation constant of the Normal Inverse Wishart distribtuion
+        See e.g. Murphy, K.: Machine Learning - A Probabilistic Perspective, p.133
+        :param dim: dimension of mean (D)
+        :param prior_strength: strength of prior mean (kappa)
+        :param cov_df: degrees of freedom (nu)
+        :param cov_scale: scale matrix (S)
+        """
+        dim = float(dim)
+        cov_df = float(cov_df)
+        prior_strength = float(prior_strength)
+        pi = np.pi
+        log = np.log
+        det = np.linalg.det
+        lngamma = sci.gammaln
+        sum_log_gammas = np.sum([lngamma((cov_df+1.0-i)/2.0) for i in range(1,int(dim)+1)])
+
+        return (cov_df+1.0)*dim/2.0*log(2.0)+\
+               dim*(dim+1.0)/4.0*log(pi)-\
+               dim/2.0*log(prior_strength)-\
+               cov_df/2.0*log(det(cov_scale))+\
+               sum_log_gammas
+
     def _niw_normalisation(self, dim, prior_strength, cov_df, cov_scale):
         """
         Computes the normalisation constant of the Normal Inverse Wishart distribtuion
@@ -305,25 +424,26 @@ class Gibbs_GMM(object):
                np.linalg.det(cov_scale)**(-cov_df/2.0)*\
                np.prod(np.array([math.gamma((cov_df+1.0-i)/2.0) for i in range(1,int(dim+1))]))
 
-        #return 2.0**(dim*cov_df/2.0) * \
-        #        math.gamma(cov_df/2.0)*(2.0*np.pi/prior_strength)**(dim/2.0)* \
-        #        np.linalg.det(cov_scale)**(-cov_df/2.0)
-
     def train(self, nIter, plot=False):
         for t in range(nIter):
-            logging.info("----------------------------------------------------")
+            logging.info("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
+            logging.info("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
             logging.info("Iteration %d" % t)
             self._fc_indicators()
             self._fc_mixings()
             self._fc_gaussians()
 
             self._update_log_lik()
+            self.save_current_plot(count=t)
 
             if plot:
                 self.update_plot(t)
 
-            plt.plot(self.log_lik_values)
-            plt.show()
+        f,ax = plt.subplots()
+        ax.plot(self.log_lik_values)
+        ax.set_title("Data/Cluster assignment joint likelihood")
+        f.savefig("GMM_Log_likelihood.png")
+        plt.close()
 
         if plot:
             ani = animation.ArtistAnimation(self.f, self.ims, interval=500, blit=True,
@@ -331,7 +451,6 @@ class Gibbs_GMM(object):
 
             self.ax.set_xlim(-10,10)
             self.ax.set_ylim(-10,10)
-            plt.show()
             #ani.save('GibbsGMM_2.mp4', fps=2)
             #ani.save('GibbsGMM_2.mp4', writer = 'mencoder', fps=2)
             FFwriter = animation.FFMpegWriter()
@@ -340,6 +459,6 @@ class Gibbs_GMM(object):
 if __name__ == "__main__":
     prior_means = [np.array([3,0]), np.array([0,-2]), np.array([-3,0])]
     gmm = Gibbs_GMM(nClusters=3, N=200, prior_means=prior_means)
-    gmm.train(nIter=25, plot=True)
-    plt.show()
+    #gmm = Gibbs_GMM(nClusters=3, N=200)
+    gmm.train(nIter=25, plot=False)
 
