@@ -1,4 +1,8 @@
-# Sentiment Analysis on imdb data
+# maxhoefl.com
 
-Having fun with Keras :)
+## Projects
+
+### GMM
+### Sentiment Analysis
+### Sequence models with attention
 
