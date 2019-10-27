@@ -2,13 +2,15 @@ import pandas as pd
 import numpy as np
 import calendar
 import logging
+from optparse import OptionParser
 from matplotlib import pyplot as plt
 
 from keras.models import Model
 from keras.layers import Input, Dense, Embedding, SimpleRNN, SimpleRNNCell, RNN
+from keras.callbacks import TensorBoard, History
 
 
-logging.basicConfig(format='%(asctime)-15s %(message)s')
+logging.basicConfig(format='%(asctime)-15s %(levelname)s : %(message)s', level=logging.DEBUG)
 
 def create_dataset(N, append_eod_token=True):
     dateformats = {
@@ -154,20 +156,24 @@ def train(num_training_samples, num_epochs):
         size_output_vocab=len(output_vocab)
     )
     model.compile(optimizer='adam', loss='categorical_crossentropy')
+    callbacks = [
+        TensorBoard(log_dir='./logs', update_freq='batch')
+    ]
     training_history = model.fit(
         x=[encoder_inputs, decoder_inputs],
         y=decoder_targets,
         epochs=num_epochs,
-        validation_split=0.2
+        validation_split=0.2,
+        callbacks=callbacks
     )
     return model, training_history, input_index, output_index
 
 
 def inference_encoder_decoder(model):
-    encoder = Model(model.get_layer(name="encoder_input"), model.get_layer(name="encoder_rnn_state"))
+    encoder = Model(model.get_layer(name="encoder_input").input, model.get_layer(name="encoder_rnn").output[-1])
 
     rnn_dim = model.get_layer(name="decoder_rnn").input_shape[-1][-1]
-    decoder_input = model.get_layer(name="decoder_input")
+    decoder_input = model.get_layer(name="decoder_input").input
     decoder_initstate = Input(shape=(rnn_dim,), name="decoder_initstate")
     decoder_embedding = model.get_layer(name="decoder_embedding")(decoder_input)
     decoder_rnn, decoder_state = model.get_layer(name="decoder_rnn")(decoder_embedding, initial_state=decoder_initstate)
@@ -203,16 +209,48 @@ def infer(xin, encoder, decoder, input_index, output_index):
 
 
 if __name__ == "__main__":
-    num_training_samples = 10000
-    num_test_samples = 1000
-    num_epochs = 10
+    parser = OptionParser()
+    parser.add_option(
+        "-n",
+        "--num-train",
+        dest="num_training_samples",
+        help="number of training samples",
+        default=2000,
+        type="int"
+    )
+    parser.add_option(
+        "-t",
+        "--num-test",
+        dest="num_test_samples",
+        help="number of test samples",
+        default=100,
+        type="int"
+    )
+    parser.add_option(
+        "-e",
+        "--num-epochs",
+        dest="num_epochs",
+        help="number of epochs",
+        default=10,
+        type="int"
+    )
+    (options, args) = parser.parse_args()
+
+    num_training_samples = options.num_training_samples
+    num_test_samples = options.num_test_samples
+    num_epochs = options.num_epochs
+
+    logging.info(f"Training model on {num_training_samples} training samples for {num_epochs} epochs")
 
     model, training_history, input_index, output_index = train(num_training_samples, num_epochs)
     encoder, decoder = inference_encoder_decoder(model)
 
+    logging.info(f"Testing model on {num_test_samples} test samples")
     testset = create_dataset(num_test_samples, append_eod_token=False)
     inferred_samples = []
-    for x in testset.Input:
+    for i, x in enumerate(testset.Input):
+        if i % 100 == 0:
+            logging.info(f"Testing progress: {i} / {num_test_samples} done")
         inferred_samples.append(infer(x, encoder, decoder, input_index, output_index))
     testset.loc[:,"PredOutput"] = inferred_samples
     testaccuracy = len(testset.loc[testset.Output == testset.PredOutput]) / num_test_samples
